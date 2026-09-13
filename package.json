@@ -34,7 +34,8 @@
     "smoke:alerts": "node tests/smoke/network-alerts-smoke.js",
     "capture:screenshots": "node tests/smoke/capture-pr-screenshots.js",
     "native:process": "node tools/build-process-helper.js",
-    "native:check": "node tools/check-process-helper.js"
+    "native:check": "node tools/check-process-helper.js",
+    "validate:i18n": "node tools/validate-i18n.js"
   },
   "dependencies": {
     "argon2": "^0.45.1",
