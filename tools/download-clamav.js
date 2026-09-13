@@ -3,13 +3,16 @@ const path = require('path');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 const axios = require('axios');
-const AdmZip = require('adm-zip');
+const { extractZipSecurely, isInside, assertNoSymlinkOrReparse } = require('./secure-zip-extract');
 
 const CLAMAV_URL = 'https://github.com/Cisco-Talos/clamav/releases/download/clamav-1.5.2/clamav-1.5.2.win.x64.zip';
 const CLAMAV_SHA256 = '6f868ed7a7e5a15aced82c53a4fa9f3f42fa9d7f7de14a606ba8db0756518eed';
 const REQUIRED_BINARIES = ['clamscan.exe', 'freshclam.exe'];
-const TARGET_DIR = path.join(__dirname, '..', 'assets', 'clamav');
-const ZIP_PATH = path.join(__dirname, '..', 'assets', 'clamav.zip');
+const ASSETS_DIR = path.join(__dirname, '..', 'assets');
+const TARGET_DIR = path.join(ASSETS_DIR, 'clamav');
+// Legacy fixed download path from before the secure-extraction fix. It is only
+// ever removed (rm of a symlink removes the link itself), never written to.
+const LEGACY_ZIP_PATH = path.join(ASSETS_DIR, 'clamav.zip');
 const DOWNLOAD_TIMEOUT_MS = 120000;
 
 function removePath(targetPath) {
@@ -26,17 +29,95 @@ function sha256File(filePath) {
   });
 }
 
+async function verifyChecksum(filePath, expectedDigest) {
+  const digest = await sha256File(filePath);
+  if (digest.toLowerCase() !== String(expectedDigest).toLowerCase()) {
+    throw new Error(`ClamAV archive checksum mismatch (expected ${expectedDigest}, got ${digest})`);
+  }
+  return digest;
+}
+
+function assertSafeDir(pathToCheck, label) {
+  const resolved = path.resolve(pathToCheck);
+  let st;
+  try {
+    st = fs.lstatSync(resolved);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`${label} is a symlink: ${resolved}`);
+  }
+  // Reparse points/junctions are not symlinks to lstat: reject those too
+  // where Node exposes them (Windows).
+  assertNoSymlinkOrReparse(resolved);
+}
+
+function createSecureStagingDir(parentDir) {
+  fs.mkdirSync(parentDir, { recursive: true });
+  assertSafeDir(parentDir, 'Staging parent');
+  const staging = fs.mkdtempSync(path.join(parentDir, '.clamav-staging-'));
+  try {
+    fs.chmodSync(staging, 0o700);
+  } catch (_) {
+    // Windows ACLs ignore POSIX modes; random suffix already isolates the dir.
+  }
+  return staging;
+}
+
+function createUniqueBackupPath(parentDir, baseName) {
+  const suffix = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+  return path.join(parentDir, `${baseName}.bak-${suffix}`);
+}
+
 function flattenExtractedDir(rootDir) {
-  const entries = fs.readdirSync(rootDir);
+  const resolvedRoot = path.resolve(rootDir);
+  const entries = fs.readdirSync(resolvedRoot);
   for (const entry of entries) {
-    const entryPath = path.join(rootDir, entry);
-    if (!fs.statSync(entryPath).isDirectory()) continue;
+    const entryPath = path.join(resolvedRoot, entry);
+    let st;
+    try {
+      st = fs.lstatSync(entryPath);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to flatten symlink: ${entryPath}`);
+    }
+    assertNoSymlinkOrReparse(entryPath);
+    if (!st.isDirectory()) continue;
     for (const file of fs.readdirSync(entryPath)) {
       const src = path.join(entryPath, file);
-      const dst = path.join(rootDir, file);
-      if (!fs.existsSync(dst)) {
-        fs.renameSync(src, dst);
+      const dst = path.join(resolvedRoot, file);
+      if (!isInside(src, resolvedRoot) || !isInside(dst, resolvedRoot)) {
+        throw new Error('Flatten target escapes extraction root');
       }
+      let srcStat;
+      try {
+        srcStat = fs.lstatSync(src);
+      } catch (err) {
+        if (err && err.code === 'ENOENT') continue;
+        throw err;
+      }
+      if (srcStat.isSymbolicLink()) {
+        throw new Error(`Refusing to flatten symlink: ${src}`);
+      }
+      assertNoSymlinkOrReparse(src);
+      let dstStat = null;
+      try {
+        dstStat = fs.lstatSync(dst);
+      } catch (err) {
+        if (!err || err.code !== 'ENOENT') throw err;
+      }
+      if (dstStat) {
+        if (dstStat.isSymbolicLink()) {
+          throw new Error(`Refusing to overwrite symlink: ${dst}`);
+        }
+        continue;
+      }
+      fs.renameSync(src, dst);
     }
     fs.rmdirSync(entryPath);
   }
@@ -45,19 +126,99 @@ function flattenExtractedDir(rootDir) {
 function validateInstall(dir) {
   for (const binary of REQUIRED_BINARIES) {
     const binaryPath = path.join(dir, binary);
-    if (!fs.existsSync(binaryPath)) {
+    let st = null;
+    try {
+      st = fs.lstatSync(binaryPath);
+    } catch (_) {
+      st = null;
+    }
+    if (!st || st.isSymbolicLink() || !st.isFile()) {
       throw new Error(`Missing required ClamAV binary: ${binary}`);
     }
   }
 }
 
-function restoreBackupIfNeeded(backupDir, backupCreated) {
-  if (!backupCreated || !fs.existsSync(backupDir)) return;
-  if (!fs.existsSync(TARGET_DIR)) {
-    fs.renameSync(backupDir, TARGET_DIR);
+function restoreBackupIfNeeded(backupDir, backupCreated, targetDir = TARGET_DIR) {
+  if (!backupCreated || !backupDir || !fs.existsSync(backupDir)) return;
+  if (!fs.existsSync(targetDir)) {
+    fs.renameSync(backupDir, targetDir);
     return;
   }
   removePath(backupDir);
+}
+
+async function installStagedArchive(stagedZipPath, options = {}) {
+  const targetDir = options.targetDir || TARGET_DIR;
+  const stagingParent = options.stagingParent || path.dirname(path.resolve(targetDir));
+  const expectedSha256 = options.expectedSha256 || CLAMAV_SHA256;
+
+  // Verify digest BEFORE any extraction or install. A mismatch never touches
+  // the current installation.
+  await verifyChecksum(stagedZipPath, expectedSha256);
+
+  const stagingRoot = options.stagingRoot || createSecureStagingDir(stagingParent);
+  const createdStaging = !options.stagingRoot;
+  const extractDir = path.join(stagingRoot, 'extract');
+  if (!fs.existsSync(extractDir)) {
+    fs.mkdirSync(extractDir, { recursive: true });
+  }
+  let backupDir = null;
+  let backupCreated = false;
+  let extractMoved = false;
+
+  try {
+    console.log('Extracting ClamAV...');
+    extractZipSecurely(stagedZipPath, extractDir);
+    flattenExtractedDir(extractDir);
+    validateInstall(extractDir);
+
+    if (fs.existsSync(targetDir)) {
+      assertSafeDir(targetDir, 'Current install');
+      backupDir = options.backupDir || createUniqueBackupPath(stagingParent, path.basename(targetDir));
+      if (fs.existsSync(backupDir)) {
+        assertSafeDir(backupDir, 'Backup path');
+        removePath(backupDir);
+      }
+      fs.renameSync(targetDir, backupDir);
+      backupCreated = true;
+    }
+
+    try {
+      fs.renameSync(extractDir, targetDir);
+      extractMoved = true;
+    } catch (swapErr) {
+      restoreBackupIfNeeded(backupDir, backupCreated, targetDir);
+      backupCreated = false;
+      throw swapErr;
+    }
+
+    if (backupCreated && backupDir && fs.existsSync(backupDir)) {
+      try {
+        removePath(backupDir);
+      } catch (cleanupErr) {
+        console.warn(`Failed to remove old ClamAV backup at ${backupDir}: ${cleanupErr.message}`);
+      }
+      backupCreated = false;
+    }
+
+    return { targetDir, backupCleaned: !backupCreated };
+  } catch (err) {
+    if (!extractMoved) {
+      try {
+        removePath(extractDir);
+      } catch (_) {}
+    } else if (fs.existsSync(targetDir)) {
+      // Swap succeeded but later cleanup failed; leave the new install in place.
+    }
+    restoreBackupIfNeeded(backupDir, backupCreated, targetDir);
+    throw err;
+  } finally {
+    if (createdStaging) {
+      try {
+        removePath(stagingRoot);
+      } catch (_) {}
+    }
+  }
 }
 
 async function downloadClamAV() {
@@ -67,11 +228,8 @@ async function downloadClamAV() {
   }
 
   console.log(`Downloading ClamAV from ${CLAMAV_URL}...`);
-  fs.mkdirSync(path.join(__dirname, '..', 'assets'), { recursive: true });
-
-  const tempDir = `${TARGET_DIR}.tmp-${process.pid}`;
-  const backupDir = `${TARGET_DIR}.bak-${process.pid}`;
-  let backupCreated = false;
+  const stagingRoot = createSecureStagingDir(ASSETS_DIR);
+  const stagedZipPath = path.join(stagingRoot, 'clamav.zip');
 
   try {
     const response = await axios({
@@ -84,56 +242,65 @@ async function downloadClamAV() {
       }
     });
 
-    const writer = fs.createWriteStream(ZIP_PATH);
+    // 'wx' fails closed if the staging file already exists instead of
+    // truncating through a pre-planted link; the staging name itself is random.
+    const writer = fs.createWriteStream(stagedZipPath, { mode: 0o600, flags: 'wx' });
     await pipeline(response.data, writer);
 
-    const digest = await sha256File(ZIP_PATH);
-    if (digest !== CLAMAV_SHA256) {
-      throw new Error(`ClamAV archive checksum mismatch (expected ${CLAMAV_SHA256}, got ${digest})`);
-    }
-
-    removePath(tempDir);
-    fs.mkdirSync(tempDir, { recursive: true });
-
-    console.log('Extracting ClamAV...');
-    const zip = new AdmZip(ZIP_PATH);
-    zip.extractAllTo(tempDir, true);
-    flattenExtractedDir(tempDir);
-    validateInstall(tempDir);
-
-    if (fs.existsSync(TARGET_DIR)) {
-      fs.renameSync(TARGET_DIR, backupDir);
-      backupCreated = true;
-    }
+    // installStagedArchive reuses the same staging root so the verified
+    // archive and the extraction directory stay on one filesystem (atomic
+    // rename into assets/) and are cleaned up together.
+    await installStagedArchive(stagedZipPath, {
+      targetDir: TARGET_DIR,
+      stagingParent: ASSETS_DIR,
+      stagingRoot,
+      expectedSha256: CLAMAV_SHA256,
+    });
 
     try {
-      fs.renameSync(tempDir, TARGET_DIR);
-    } catch (swapErr) {
-      restoreBackupIfNeeded(backupDir, backupCreated);
-      backupCreated = false;
-      throw swapErr;
-    }
-
-    if (backupCreated && fs.existsSync(backupDir)) {
-      try {
-        removePath(backupDir);
-      } catch (cleanupErr) {
-        console.warn(`Failed to remove old ClamAV backup at ${backupDir}: ${cleanupErr.message}`);
-      }
-      backupCreated = false;
-    }
-
-    removePath(ZIP_PATH);
+      removePath(stagingRoot);
+    } catch (_) {}
+    try {
+      removePath(LEGACY_ZIP_PATH);
+    } catch (_) {}
     console.log('ClamAV downloaded and extracted successfully.');
   } catch (err) {
-    removePath(tempDir);
-    removePath(ZIP_PATH);
-    restoreBackupIfNeeded(backupDir, backupCreated);
+    try {
+      removePath(stagingRoot);
+    } catch (_) {}
+    try {
+      removePath(LEGACY_ZIP_PATH);
+    } catch (_) {}
+    // Rollback of an existing install (if any) is handled inside
+    // installStagedArchive; a download/verify failure never touches TARGET_DIR.
     throw err;
   }
 }
 
-downloadClamAV().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  downloadClamAV().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  CLAMAV_URL,
+  CLAMAV_SHA256,
+  REQUIRED_BINARIES,
+  TARGET_DIR,
+  ASSETS_DIR,
+  LEGACY_ZIP_PATH,
+  ZIP_PATH: LEGACY_ZIP_PATH,
+  DOWNLOAD_TIMEOUT_MS,
+  removePath,
+  sha256File,
+  verifyChecksum,
+  createSecureStagingDir,
+  createUniqueBackupPath,
+  flattenExtractedDir,
+  validateInstall,
+  restoreBackupIfNeeded,
+  installStagedArchive,
+  downloadClamAV,
+};
