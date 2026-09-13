@@ -6,18 +6,18 @@ const path = require('path');
 const LOCALES_DIR = path.join(__dirname, '..', 'src', 'i18n', 'locales');
 const REFERENCE_FILE = 'en.json';
 
-// Recursively collects leaf key paths ("settings.theme.title") so flat and
-// nested locale files can be compared on equal footing. Keys that appear both
-// as a flat dotted key and inside a nested object are reported as duplicates.
-function collectKeys(value, prefix, keys, duplicates) {
-  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    const entries = Object.entries(value);
-    if (!entries.length) {
-      if (prefix) keys.add(prefix);
-      return;
-    }
-    for (const [key, child] of entries) {
-      collectKeys(child, prefix ? `${prefix}.${key}` : key, keys, duplicates);
+// Recursively collects leaf key paths ("settings.theme.title") so flattened
+// files can be compared key-by-key. Object and array values are recorded in
+// `nested` instead of being treated as valid leaves: the runtime lookup is a
+// flat `catalog[key]`, so a nested object would pass a flattened comparison
+// yet fail at runtime and fall back to English. Keys that appear both as a
+// flat dotted key and inside a nested object are reported as duplicates.
+function collectKeys(value, prefix, keys, duplicates, nested) {
+  if (value !== null && typeof value === 'object') {
+    if (prefix) nested.add(prefix);
+    if (Array.isArray(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      collectKeys(child, prefix ? `${prefix}.${key}` : key, keys, duplicates, nested);
     }
     return;
   }
@@ -26,9 +26,9 @@ function collectKeys(value, prefix, keys, duplicates) {
 }
 
 // Reads and parses a locale file without modifying it.
-// Returns { keys, duplicates } or { error }.
-function loadLocale(file) {
-  const filePath = path.join(LOCALES_DIR, file);
+// Returns { keys, duplicates, nested } or { error }.
+function loadLocale(file, localesDir = LOCALES_DIR) {
+  const filePath = path.join(localesDir, file);
   let raw;
   try {
     raw = fs.readFileSync(filePath, 'utf8');
@@ -49,67 +49,123 @@ function loadLocale(file) {
 
   const keys = new Set();
   const duplicates = new Set();
-  collectKeys(parsed, '', keys, duplicates);
-  return { keys, duplicates };
+  const nested = new Set();
+  collectKeys(parsed, '', keys, duplicates, nested);
+  return { keys, duplicates, nested };
 }
 
-function main() {
-  if (!fs.existsSync(LOCALES_DIR)) {
-    console.error(`Locales directory not found: ${LOCALES_DIR}`);
-    process.exitCode = 1;
-    return;
+// Builds the list of problems for a loaded locale vs the reference.
+// Returns an array of messages; empty when the locale is valid.
+function localeProblems(reference, locale) {
+  const problems = [];
+  for (const key of [...reference.keys].filter((key) => !locale.keys.has(key)).sort()) {
+    problems.push(`missing key: ${key}`);
+  }
+  for (const key of [...locale.keys].filter((key) => !reference.keys.has(key)).sort()) {
+    problems.push(`extra key: ${key}`);
+  }
+  for (const key of [...locale.duplicates].sort()) {
+    problems.push(`duplicate key: ${key}`);
+  }
+  for (const key of [...locale.nested].sort()) {
+    problems.push(`nested object: ${key} (locale files must use flat dotted keys)`);
+  }
+  return problems;
+}
+
+// Problems that apply to the reference file itself: ambiguous flattened
+// paths and nested structures make every other locale's comparison
+// unreliable, so they must fail validation too.
+function referenceProblems(reference) {
+  const problems = [];
+  for (const key of [...reference.duplicates].sort()) {
+    problems.push(`duplicate key: ${key}`);
+  }
+  for (const key of [...reference.nested].sort()) {
+    problems.push(`nested object: ${key} (locale files must use flat dotted keys)`);
+  }
+  return problems;
+}
+
+// Validates every locale file under localesDir against en.json.
+// Returns { fatal } on setup errors, otherwise
+// { checked, keyCount, failures: [{ file, problems }] }.
+function validate(localesDir = LOCALES_DIR) {
+  if (!fs.existsSync(localesDir)) {
+    return { fatal: `Locales directory not found: ${localesDir}` };
   }
 
-  const files = fs.readdirSync(LOCALES_DIR)
+  const files = fs.readdirSync(localesDir)
     .filter((file) => file.endsWith('.json'))
     .sort();
 
   if (!files.includes(REFERENCE_FILE)) {
-    console.error(`Reference locale ${REFERENCE_FILE} not found in ${LOCALES_DIR}`);
-    process.exitCode = 1;
-    return;
+    return { fatal: `Reference locale ${REFERENCE_FILE} not found in ${localesDir}` };
   }
 
-  const reference = loadLocale(REFERENCE_FILE);
+  const reference = loadLocale(REFERENCE_FILE, localesDir);
   if (reference.error) {
-    console.error(`${REFERENCE_FILE}: ${reference.error}`);
-    process.exitCode = 1;
-    return;
+    return { fatal: `${REFERENCE_FILE}: ${reference.error}` };
   }
 
-  let failures = 0;
-  let checked = 0;
+  const failures = [];
+  const refProblems = referenceProblems(reference);
+  if (refProblems.length) {
+    failures.push({ file: REFERENCE_FILE, problems: refProblems });
+  }
 
+  let checked = 0;
   for (const file of files) {
     if (file === REFERENCE_FILE) continue;
     checked++;
 
-    const locale = loadLocale(file);
+    const locale = loadLocale(file, localesDir);
     if (locale.error) {
-      failures++;
-      console.error(`${file}: ${locale.error}`);
+      failures.push({ file, problems: [locale.error] });
       continue;
     }
 
-    const missing = [...reference.keys].filter((key) => !locale.keys.has(key)).sort();
-    const extra = [...locale.keys].filter((key) => !reference.keys.has(key)).sort();
-    const duplicates = [...locale.duplicates].sort();
-
-    if (missing.length || extra.length || duplicates.length) {
-      failures++;
-      console.error(`${file}:`);
-      for (const key of missing) console.error(`  - missing key: ${key}`);
-      for (const key of extra) console.error(`  - extra key: ${key}`);
-      for (const key of duplicates) console.error(`  - duplicate key: ${key}`);
+    const problems = localeProblems(reference, locale);
+    if (problems.length) {
+      failures.push({ file, problems });
     }
   }
 
-  if (failures) {
-    console.error(`i18n validation failed: ${failures} of ${checked} locale(s) differ from ${REFERENCE_FILE}.`);
+  return { checked, keyCount: reference.keys.size, failures };
+}
+
+function main() {
+  const result = validate(LOCALES_DIR);
+
+  if (result.fatal) {
+    console.error(result.fatal);
+    process.exitCode = 1;
+    return;
+  }
+
+  for (const { file, problems } of result.failures) {
+    console.error(`${file}:`);
+    for (const problem of problems) console.error(`  - ${problem}`);
+  }
+
+  if (result.failures.length) {
+    console.error(`i18n validation failed: ${result.failures.length} of ${result.checked + 1} locale file(s) have problems (reference: ${REFERENCE_FILE}).`);
     process.exitCode = 1;
   } else {
-    console.log(`i18n validation passed: ${checked} locale(s) match ${REFERENCE_FILE} (${reference.keys.size} keys each).`);
+    console.log(`i18n validation passed: ${result.checked} locale(s) match ${REFERENCE_FILE} (${result.keyCount} keys each).`);
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  LOCALES_DIR,
+  REFERENCE_FILE,
+  collectKeys,
+  loadLocale,
+  localeProblems,
+  referenceProblems,
+  validate
+};
