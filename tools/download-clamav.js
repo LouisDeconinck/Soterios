@@ -282,8 +282,13 @@ async function installStagedArchive(stagedZipPath, options = {}) {
   }
 }
 
+function hasCompleteInstall(dir) {
+  return fs.existsSync(dir) &&
+    REQUIRED_BINARIES.every((binary) => fs.existsSync(path.join(dir, binary)));
+}
+
 async function downloadClamAV({ log = console.log } = {}) {
-  if (fs.existsSync(TARGET_DIR) && fs.existsSync(path.join(TARGET_DIR, 'clamscan.exe'))) {
+  if (hasCompleteInstall(TARGET_DIR)) {
     log('ClamAV already downloaded.');
     return;
   }
@@ -397,6 +402,7 @@ module.exports = {
   createUniqueBackupPath,
   flattenExtractedDir,
   validateInstall,
+  hasCompleteInstall,
   restoreBackupIfNeeded,
   installStagedArchive,
   downloadClamAV,
